@@ -1,10 +1,34 @@
-from typing import TypedDict, List, Optional, Literal
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-from agents import manager, searcher, filter_node, analyst, writer
-from agents import router_logic, filter_logic
+"""
+graph.py
+--------
+LangGraph 워크플로우 설계도 (웹 앱용).
 
-# ── 상태 정의 ──────────────────────────────────────────────
+흐름:
+  Manager → Searcher → Filter → Human_Approval[interrupt]
+    approve/modify → dispatch → restaurant_subgraph (병렬) → Collector → Writer
+    reject         → Searcher (재검색)
+"""
+
+import operator
+import os
+from typing import TypedDict, List, Optional, Annotated
+
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Send
+
+from agents import (
+    manager, router_logic, searcher,
+    filter_node, filter_logic,
+    human_approval,
+    extract_single, analyst_single,
+    collector, writer,
+)
+
+
+# ────────────────────────────────────────────
+# 상태 정의
+# ────────────────────────────────────────────
 class AgentState(TypedDict):
     query:               str
     location:            Optional[str]
@@ -13,51 +37,108 @@ class AgentState(TypedDict):
     max_price:           Optional[int]
     candidates:          List[dict]
     filtered_candidates: List[dict]
-    selected_indices:    Optional[List[int]]
-    analysis_report:     Optional[str]
+    needs_retry:         bool
+    selected_indices:    List[int]
+    insights:            Annotated[List[dict], operator.add]  # 병렬 결과 자동 누적
+    analysis_report:     Optional[dict]
     final_answer:        Optional[str]
     retry_count:         int
 
-# ── Human-Approval 노드 (징검다리) ─────────────────────────
-def human_approval(state: AgentState):
-    """중단점 이후 사용자가 주입한 selected_indices를 그대로 전달"""
-    return state
 
-# ── 그래프 구성 ────────────────────────────────────────────
+class SubgraphState(TypedDict):
+    restaurant:       dict
+    preferences:      List[str]
+    max_price:        Optional[int]
+    extracted_detail: Optional[dict]
+    insight:          Optional[dict]
+
+
+# ────────────────────────────────────────────
+# 서브그래프 (식당 1개: Extract → Analyst)
+# ────────────────────────────────────────────
+def build_restaurant_subgraph():
+    sub = StateGraph(SubgraphState)
+    sub.add_node("extractor",     extract_single)
+    sub.add_node("analyst_single", analyst_single)
+    sub.set_entry_point("extractor")
+    sub.add_edge("extractor", "analyst_single")
+    sub.add_edge("analyst_single", END)
+    return sub.compile()
+
+restaurant_subgraph = build_restaurant_subgraph()
+
+
+# ────────────────────────────────────────────
+# dispatch 노드: selected_indices → Send() 병렬 발행
+# human_approval의 Command(goto="dispatch") 이후 실행
+# ────────────────────────────────────────────
+def dispatch_to_subgraphs(state: AgentState) -> List[Send]:
+    selected  = state.get("selected_indices", [0])
+    all_cands = state.get("filtered_candidates", [])
+    targets   = [all_cands[i] for i in selected if i < len(all_cands)] or all_cands[:3]
+
+    print(f"--- [DISPATCH] {len(targets)}개 식당 병렬 분석 ---")
+    return [
+        Send("restaurant_subgraph", {
+            "restaurant":  r,
+            "preferences": state.get("preferences", []),
+            "max_price":   state.get("max_price"),
+        })
+        for r in targets
+    ]
+
+
+def run_restaurant_subgraph(state: SubgraphState) -> dict:
+    result  = restaurant_subgraph.invoke(state)
+    insight = result.get("insight")
+    return {"insights": [insight]} if insight else {"insights": []}
+
+
+# ────────────────────────────────────────────
+# 메인 그래프 구성
+# ────────────────────────────────────────────
 workflow = StateGraph(AgentState)
 
-workflow.add_node("manager",        manager)
-workflow.add_node("searcher",       searcher)
-workflow.add_node("filter",         filter_node)
-workflow.add_node("human_approval", human_approval)
-workflow.add_node("analyst",        analyst)
-workflow.add_node("writer",         writer)
+workflow.add_node("manager",             manager)
+workflow.add_node("searcher",            searcher)
+workflow.add_node("filter",              filter_node)
+workflow.add_node("human_approval",      human_approval)
+workflow.add_node("dispatch",            lambda s: s)       # 상태 통과, Send()로 분기
+workflow.add_node("restaurant_subgraph", run_restaurant_subgraph)
+workflow.add_node("collector",           collector)
+workflow.add_node("writer",              writer)
 
 workflow.set_entry_point("manager")
 
-workflow.add_conditional_edges(
-    "manager",
-    router_logic,
-    {"searcher": "searcher", "analyst": "analyst"}
-)
+workflow.add_conditional_edges("manager", router_logic,
+    {"searcher": "searcher", "analyst": "collector"})
 
 workflow.add_edge("searcher", "filter")
 
-workflow.add_conditional_edges(
-    "filter",
-    filter_logic,
-    {"searcher": "searcher", "human_approval": "human_approval"}
-)
+workflow.add_conditional_edges("filter", filter_logic,
+    {"searcher": "searcher", "human_approval": "human_approval"})
 
-workflow.add_edge("human_approval", "analyst")
-workflow.add_edge("analyst", "writer")
+# human_approval → Command(goto="dispatch" or "searcher")
+workflow.add_conditional_edges("human_approval", lambda s: s,
+    {"dispatch": "dispatch", "searcher": "searcher"})
+
+# dispatch → Send() → restaurant_subgraph (병렬)
+workflow.add_conditional_edges("dispatch", dispatch_to_subgraphs,
+    ["restaurant_subgraph"])
+
+workflow.add_edge("restaurant_subgraph", "collector")
+workflow.add_edge("collector", "writer")
 workflow.add_edge("writer", END)
 
-memory  = MemorySaver()
-app = workflow.compile(
-    checkpointer=memory,
-    interrupt_before=["human_approval"]
-)
 
-# langgraph.json 호환용 alias
-main_agent = app
+# ────────────────────────────────────────────
+# SQLite 체크포인트 + 컴파일
+# ────────────────────────────────────────────
+DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+sqlite_saver = SqliteSaver.from_conn_string(DB_PATH)
+
+app = workflow.compile(checkpointer=sqlite_saver)
+
+main_agent = app  # langgraph.json 호환
