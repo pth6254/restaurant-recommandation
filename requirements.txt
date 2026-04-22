@@ -1,0 +1,19 @@
+# 핵심 프레임워크
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+
+# ✅ Ollama 연동 (OpenAI 대체)
+langchain-ollama>=0.2.0
+
+# 검색 도구
+langchain-community>=0.3.0   # TavilySearchResults
+tavily-python>=0.3.0
+
+# 유틸리티
+python-dotenv>=1.0.0
+requests>=2.32.0
+pydantic>=2.0.0
+
+# (선택) LangSmith 트레이싱
+langsmith>=0.1.0
