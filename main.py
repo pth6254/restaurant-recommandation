@@ -15,7 +15,10 @@ load_dotenv()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from graph import workflow, DB_PATH
+import app_state
 from chat import router as chat_router
 
 
@@ -40,8 +43,11 @@ def check_ollama():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    check_ollama()
-    yield
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(DB_PATH) as checkpointer:
+        app_state.langgraph_app = workflow.compile(checkpointer=checkpointer)
+        check_ollama()
+        yield
 
 
 # ────────────────────────────────────────────

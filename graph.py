@@ -14,7 +14,6 @@ import os
 from typing import TypedDict, List, Optional, Annotated
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Send
 
 from agents import (
@@ -88,8 +87,8 @@ def dispatch_to_subgraphs(state: AgentState) -> List[Send]:
     ]
 
 
-def run_restaurant_subgraph(state: SubgraphState) -> dict:
-    result  = restaurant_subgraph.invoke(state)
+async def run_restaurant_subgraph(state: SubgraphState) -> dict:
+    result  = await restaurant_subgraph.ainvoke(state)
     insight = result.get("insight")
     return {"insights": [insight]} if insight else {"insights": []}
 
@@ -119,8 +118,12 @@ workflow.add_conditional_edges("filter", filter_logic,
     {"searcher": "searcher", "human_approval": "human_approval"})
 
 # human_approval → Command(goto="dispatch" or "searcher")
-workflow.add_conditional_edges("human_approval", lambda s: s,
-    {"dispatch": "dispatch", "searcher": "searcher"})
+# Command API가 실제 라우팅을 처리; 아래는 그래프 노드 연결 선언용
+workflow.add_conditional_edges(
+    "human_approval",
+    lambda s: "dispatch",   # 런타임에 호출되지 않음 — Command(goto=...) 가 우선
+    {"dispatch": "dispatch", "searcher": "searcher"},
+)
 
 # dispatch → Send() → restaurant_subgraph (병렬)
 workflow.add_conditional_edges("dispatch", dispatch_to_subgraphs,
@@ -131,14 +134,4 @@ workflow.add_edge("collector", "writer")
 workflow.add_edge("writer", END)
 
 
-# ────────────────────────────────────────────
-# SQLite 체크포인트 + 컴파일
-# ────────────────────────────────────────────
 DB_PATH = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-sqlite_saver = SqliteSaver.from_conn_string(DB_PATH)
-
-app = workflow.compile(checkpointer=sqlite_saver)
-
-main_agent = app  # langgraph.json 호환

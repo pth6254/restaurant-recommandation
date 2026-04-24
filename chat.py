@@ -7,6 +7,8 @@ FastAPI 라우터. SSE(Server-Sent Events)로 LangGraph 진행 상황 실시간 
   GET  /api/chat/start/stream   → 검색~필터 진행상황 스트리밍 + candidates
   GET  /api/chat/select/stream  → 분석 진행상황 스트리밍 + final_answer
   POST /api/chat/reject         → 재검색 (빠른 응답, SSE 불필요)
+  POST /api/chat/bookmark       → 북마크 추가
+  POST /api/chat/share          → 공유 코드 생성
 
 SSE 이벤트 타입:
   progress → 노드 완료 알림  {"node": "manager", "label": "질문 분석 완료"}
@@ -17,6 +19,7 @@ SSE 이벤트 타입:
 import uuid
 import json
 import asyncio
+from pathlib import Path
 from typing import List, Optional, AsyncGenerator
 
 from fastapi import APIRouter, HTTPException, Query
@@ -24,10 +27,26 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langgraph.types import Command
 
-from graph import app as langgraph_app
+import app_state
 from schemas import HitlAction
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+# ────────────────────────────────────────────
+# 파일 기반 저장소
+# ────────────────────────────────────────────
+_BOOKMARKS_FILE = Path("./data/bookmarks.json")
+_SHARES_FILE    = Path("./data/shares.json")
+
+def _load(path: Path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+    except Exception:
+        return default
+
+def _save(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ────────────────────────────────────────────
@@ -105,17 +124,20 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
     async def generate() -> AsyncGenerator[str, None]:
         try:
             completed_subgraphs = 0
+            print(f"\n[DEBUG] 검색 시작: {query}")
 
-            async for event in langgraph_app.astream_events(
+            async for event in app_state.langgraph_app.astream_events(
                 {"query": query, "insights": []},
                 config,
                 version="v2",
             ):
                 name = event.get("name", "")
                 kind = event.get("event", "")
+                if kind != "on_chat_model_stream":
+                    print(f"[DEBUG] event: kind={kind}, name={name}")
 
                 # interrupt 감지 → 루프 탈출
-                if name == "__interrupt__":
+                if kind == "on_chain_end" and "__interrupt__" in (event.get("data", {}).get("output") or {}):
                     break
 
                 # 노드 완료 → progress 이벤트 전송
@@ -127,8 +149,10 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
                         yield sse_progress(name, NODE_LABELS[name])
 
             # 최종 상태에서 candidates 추출 → result 이벤트
-            state      = langgraph_app.get_state(config)
+            state      = await app_state.langgraph_app.aget_state(config)
             candidates = state.values.get("filtered_candidates", [])
+            location   = state.values.get("location", "")
+            category   = state.values.get("category", "")
 
             if not candidates:
                 yield sse_result({"thread_id": thread_id, "candidates": [], "status": "no_results"})
@@ -136,13 +160,16 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
                 yield sse_result({
                     "thread_id": thread_id,
                     "candidates": candidates,
-                    "status": "waiting_selection",
+                    "location":   location,
+                    "category":   category,
+                    "status":     "waiting_selection",
                 })
 
         except asyncio.CancelledError:
-            # 클라이언트가 연결을 끊은 경우 (정상)
-            pass
+            print("[DEBUG] 클라이언트 연결 끊김 (정상)")
         except Exception as e:
+            import traceback
+            print(f"[DEBUG] 예외 발생:\n{traceback.format_exc()}")
             yield sse_error(f"검색 중 오류 발생: {str(e)}")
 
     return StreamingResponse(
@@ -182,7 +209,7 @@ async def select_stream(
     config = {"configurable": {"thread_id": thread_id}}
 
     # 세션 유효성 확인
-    state = langgraph_app.get_state(config)
+    state = await app_state.langgraph_app.aget_state(config)
     if not state or not state.values:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
 
@@ -193,7 +220,7 @@ async def select_stream(
             completed_subgraphs = 0
             total = len(indices)
 
-            async for event in langgraph_app.astream_events(
+            async for event in app_state.langgraph_app.astream_events(
                 Command(resume=hitl_response),
                 config,
                 version="v2",
@@ -214,7 +241,7 @@ async def select_stream(
                         yield sse_progress(name, NODE_LABELS[name])
 
             # 최종 결과 → result 이벤트
-            final_state  = langgraph_app.get_state(config)
+            final_state  = await app_state.langgraph_app.aget_state(config)
             final_answer = final_state.values.get("final_answer", "결과를 가져오지 못했습니다.")
             candidates   = final_state.values.get("filtered_candidates", [])
 
@@ -254,21 +281,22 @@ async def reject_and_research(req: RejectRequest):
     """
     config = {"configurable": {"thread_id": req.thread_id}}
 
-    state = langgraph_app.get_state(config)
+    state = await app_state.langgraph_app.aget_state(config)
     if not state or not state.values:
         raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
 
     hitl_response = HitlAction(action="reject", feedback=req.feedback)
 
-    async for event in langgraph_app.astream_events(
+    async for event in app_state.langgraph_app.astream_events(
         Command(resume=hitl_response),
         config,
         version="v2",
     ):
-        if event.get("name") == "__interrupt__":
+        kind = event.get("event", "")
+        if kind == "on_chain_end" and "__interrupt__" in (event.get("data", {}).get("output") or {}):
             break
 
-    new_state  = langgraph_app.get_state(config)
+    new_state  = await app_state.langgraph_app.aget_state(config)
     candidates = new_state.values.get("filtered_candidates", [])
 
     return RejectResponse(
@@ -276,3 +304,54 @@ async def reject_and_research(req: RejectRequest):
         candidates=candidates,
         status="waiting_selection" if candidates else "no_results",
     )
+
+
+# ────────────────────────────────────────────
+# 4. 북마크 추가: POST /bookmark
+# ────────────────────────────────────────────
+class BookmarkRequest(BaseModel):
+    restaurant_name: str
+    location:        Optional[str] = None
+    category:        Optional[str] = None
+    url:             Optional[str] = None
+    score:           Optional[float] = None
+    summary:         Optional[str] = None
+
+@router.post("/bookmark")
+async def add_bookmark(req: BookmarkRequest):
+    bookmarks = _load(_BOOKMARKS_FILE, [])
+    # 중복 방지
+    if not any(b["restaurant_name"] == req.restaurant_name for b in bookmarks):
+        bookmarks.append(req.model_dump())
+        _save(_BOOKMARKS_FILE, bookmarks)
+    return {"status": "ok", "restaurant_name": req.restaurant_name}
+
+@router.get("/bookmarks")
+async def get_bookmarks():
+    return _load(_BOOKMARKS_FILE, [])
+
+
+# ────────────────────────────────────────────
+# 5. 결과 공유
+# ────────────────────────────────────────────
+class ShareRequest(BaseModel):
+    thread_id: str
+    snapshot:  dict
+
+class ShareResponse(BaseModel):
+    share_code: str
+
+@router.post("/share", response_model=ShareResponse)
+async def create_share(req: ShareRequest):
+    shares = _load(_SHARES_FILE, {})
+    share_code = str(uuid.uuid4())[:8]
+    shares[share_code] = req.snapshot
+    _save(_SHARES_FILE, shares)
+    return ShareResponse(share_code=share_code)
+
+@router.get("/share/{share_code}")
+async def get_share(share_code: str):
+    shares = _load(_SHARES_FILE, {})
+    if share_code not in shares:
+        raise HTTPException(status_code=404, detail="공유 링크를 찾을 수 없습니다.")
+    return {"share_code": share_code, "snapshot": shares[share_code]}

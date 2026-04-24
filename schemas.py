@@ -56,6 +56,11 @@ class ExtractedDetail(BaseModel):
     raw_text: Optional[str] = None
 
 
+class FinalSummary(BaseModel):
+    top_pick: str
+    summary: str
+
+
 class HitlAction(BaseModel):
     """
     HITL 중단점 사용자 응답 스키마.

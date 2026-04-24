@@ -7,15 +7,26 @@ tools.py
 import os
 import requests
 from typing import List
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
+from langchain_core.runnables import RunnableLambda
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-def get_restaurant_search_tool():
-    """식당 후보 목록 검색용 Tavily Search 도구."""
-    return TavilySearchResults(k=10, search_depth="advanced")
+def get_restaurant_search_tool() -> RunnableLambda:
+    """식당 후보 목록 검색용 Tavily Search 도구. 결과를 list[dict]로 정규화."""
+    _tool = TavilySearch(max_results=10, search_depth="advanced")
+
+    def _normalize(input_dict: dict) -> list:
+        result = _tool.invoke(input_dict)
+        if isinstance(result, dict):
+            return result.get("results", [])
+        if isinstance(result, list):
+            return result
+        return []
+
+    return RunnableLambda(_normalize)
 
 
 def extract_restaurant_detail(urls: List[str]) -> List[dict]:
