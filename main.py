@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ollama 병렬 처리 설정 (미설정 시 기본값 3 적용)
+if not os.getenv("OLLAMA_NUM_PARALLEL"):
+    os.environ["OLLAMA_NUM_PARALLEL"] = "3"
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver

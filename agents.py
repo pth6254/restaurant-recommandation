@@ -37,7 +37,7 @@ llm_qwen = ChatOllama(
 )
 llm_exaone = ChatOllama(
     model="exaone3.5:7.8b", base_url=OLLAMA_BASE_URL,
-    temperature=0.2, format="json", num_ctx=8192,
+    temperature=0.2, format="json", num_ctx=4096,
 )
 llm_gemma = ChatOllama(
     model="gemma4:latest", base_url=OLLAMA_BASE_URL,
@@ -91,30 +91,11 @@ _MANAGER_CHAIN = (
     | StrOutputParser()
 ).with_retry(stop_after_attempt=3)
 
-_FILTER_CHAIN = (
-    ChatPromptTemplate.from_template("""
-아래 검색 결과는 블로그 포스트입니다. 각 항목에서 실제 식당 정보를 추출하고 품질 낮은 항목을 걸러내세요.
-
-처리 규칙:
-1. 제목/내용에서 실제 식당 이름을 추출해 name에 저장 (블로그 제목 그대로 넣지 말 것)
-2. 여러 식당을 나열하는 목록형 포스트(Top10, 맛집 목록 등)는 제외
-3. 광고성 콘텐츠, 정보 부족 항목 제외
-4. score는 내용에서 언급된 실제 평점(별점)이 있으면 사용, 없으면 0.0
-
-반드시 아래 JSON 형식으로만 답하세요:
-{{
-  "filtered_candidates": [{{"name":"실제식당이름","score":0.0,"review_count":null,"address":null,"category":null,"price_range":null,"source_url":null,"summary":"한줄요약"}}],
-  "needs_retry": false,
-  "reason": null
-}}
-
-후보: {candidates}
-결과 2개 미만이면 needs_retry를 true로 설정하세요.
-/no_think
-""")
-    | llm_qwen
-    | StrOutputParser()
-).with_retry(stop_after_attempt=3)
+# 목록형 블로그 포스트 제목 패턴 (LLM 없이 Python으로 필터링)
+_LIST_PATTERNS = re.compile(
+    r"(top\s*\d+|순위|맛집\s*(리스트|모음|추천|정리|베스트)|best\s*\d+|\d+\s*곳|\d+\s*선)",
+    re.IGNORECASE,
+)
 
 _EXTRACTOR_CHAIN = (
     ChatPromptTemplate.from_template("""
@@ -229,24 +210,36 @@ async def searcher(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ────────────────────────────────────────────
-# 4. FILTER
+# 4. FILTER (Python 기반 — LLM 호출 없음)
 # ────────────────────────────────────────────
-async def filter_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    print("--- [FILTER] (qwen3.5:9b) ---")
+def filter_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    print("--- [FILTER] (Python) ---")
 
-    raw_candidates = state.get("candidates", [])
-    raw = await _FILTER_CHAIN.ainvoke({"candidates": json.dumps(raw_candidates, ensure_ascii=False)})
-    result = parse_structured_output(
-        raw, FilterResult,
-        FilterResult(
-            filtered_candidates=[Restaurant(**c) for c in raw_candidates[:5]],
-            needs_retry=len(raw_candidates) < 2,
-        )
-    )
+    filtered = []
+    for item in state.get("candidates", []):
+        title   = (item.get("name") or "").strip()
+        content = (item.get("summary") or "").strip()
+
+        if _LIST_PATTERNS.search(title):   # 목록형 블로그 포스트 제외
+            continue
+        if len(content) < 30:              # 내용 너무 짧으면 제외
+            continue
+
+        filtered.append({
+            "name":        title,
+            "score":       float(item.get("score", 0.0)),
+            "source_url":  item.get("source_url") or "",
+            "summary":     content[:300],
+            "address":     item.get("address"),
+            "category":    item.get("category"),
+            "price_range": item.get("price_range"),
+            "review_count": item.get("review_count"),
+        })
+
     return {
-        "filtered_candidates": [r.model_dump() for r in result.filtered_candidates],
-        "needs_retry": result.needs_retry,
-        "retry_count": state.get("retry_count", 0) + 1,
+        "filtered_candidates": filtered[:8],
+        "needs_retry":         len(filtered) < 2,
+        "retry_count":         state.get("retry_count", 0) + 1,
     }
 
 
@@ -305,7 +298,7 @@ async def extract_single(state: dict) -> dict:
     print(f"  🔍 [EXTRACTOR] '{name}' (exaone3.5:7.8b)")
 
     prompt_text = parse_extract_to_prompt(
-        extract_restaurant_detail([url]) if url else [], name
+        await extract_restaurant_detail([url]) if url else [], name
     )
 
     raw = await _EXTRACTOR_CHAIN.ainvoke({

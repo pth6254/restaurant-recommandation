@@ -5,7 +5,7 @@ tools.py
 """
 
 import os
-import requests
+import httpx
 from typing import List
 from langchain_tavily import TavilySearch
 from langchain_core.runnables import RunnableLambda
@@ -32,8 +32,8 @@ def get_restaurant_search_tool() -> RunnableLambda:
 RESTAURANT_SEARCH_TOOL: RunnableLambda = get_restaurant_search_tool()
 
 
-def extract_restaurant_detail(urls: List[str]) -> List[dict]:
-    """Tavily Extract로 식당 URL 본문 직접 크롤링. 실패 시 빈 리스트 반환."""
+async def extract_restaurant_detail(urls: List[str]) -> List[dict]:
+    """Tavily Extract로 식당 URL 본문 비동기 크롤링. 실패 시 빈 리스트 반환."""
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
         return []
@@ -43,13 +43,13 @@ def extract_restaurant_detail(urls: List[str]) -> List[dict]:
         return []
 
     try:
-        response = requests.post(
-            "https://api.tavily.com/extract",
-            json={"api_key": api_key, "urls": valid_urls[:20]},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                "https://api.tavily.com/extract",
+                json={"api_key": api_key, "urls": valid_urls[:20]},
+            )
+            response.raise_for_status()
+            data = response.json()
 
         results = []
         for item in data.get("results", []):
@@ -63,7 +63,7 @@ def extract_restaurant_detail(urls: List[str]) -> List[dict]:
 
         return results
 
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         print("  ⚠️ Tavily Extract 타임아웃")
         return []
     except Exception as e:
