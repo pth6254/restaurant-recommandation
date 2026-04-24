@@ -29,6 +29,9 @@ def get_restaurant_search_tool() -> RunnableLambda:
     return RunnableLambda(_normalize)
 
 
+RESTAURANT_SEARCH_TOOL: RunnableLambda = get_restaurant_search_tool()
+
+
 def extract_restaurant_detail(urls: List[str]) -> List[dict]:
     """Tavily Extract로 식당 URL 본문 직접 크롤링. 실패 시 빈 리스트 반환."""
     api_key = os.getenv("TAVILY_API_KEY")

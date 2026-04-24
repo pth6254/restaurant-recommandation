@@ -24,7 +24,7 @@ from schemas import (
     QueryParams, Restaurant, FilterResult,
     RestaurantInsight, ExtractedDetail, HitlAction, FinalSummary,
 )
-from tools import get_restaurant_search_tool, extract_restaurant_detail, parse_extract_to_prompt
+from tools import RESTAURANT_SEARCH_TOOL, extract_restaurant_detail, parse_extract_to_prompt
 
 # ────────────────────────────────────────────
 # Ollama LLM 설정
@@ -211,8 +211,7 @@ def router_logic(state: Dict[str, Any]) -> str:
 async def searcher(state: Dict[str, Any]) -> Dict[str, Any]:
     print(f"--- [SEARCHER] {state.get('location')} {state.get('category')} ---")
 
-    tool = get_restaurant_search_tool()
-    raw_results = await tool.ainvoke({"query": f"{state['location']} {state['category']} 맛집 평점 리뷰"})
+    raw_results = await RESTAURANT_SEARCH_TOOL.ainvoke({"query": f"{state['location']} {state['category']} 맛집 평점 리뷰"})
 
     candidates = []
     for item in raw_results:
