@@ -24,6 +24,8 @@ class Restaurant(BaseModel):
     price_range: Optional[str] = None
     source_url: Optional[str] = None
     summary: Optional[str] = None
+    x: Optional[str] = None  # 경도 (카카오 로컬 API)
+    y: Optional[str] = None  # 위도 (카카오 로컬 API)
 
 
 class FilterResult(BaseModel):

@@ -6,6 +6,7 @@ tools.py
 
 import os
 import httpx
+import urllib.parse
 from typing import List
 from langchain_tavily import TavilySearch
 from langchain_core.runnables import RunnableLambda
@@ -85,3 +86,66 @@ def parse_extract_to_prompt(extract_results: List[dict], restaurant_name: str) -
         lines.append("")
 
     return "\n".join(lines) if lines else "크롤링 성공했으나 본문 내용 없음."
+
+
+async def search_restaurants_kakao(location: str, category: str, size: int = 15) -> List[dict]:
+    """카카오 로컬 API 키워드 검색으로 식당 목록 수집.
+    반환: place_name, address, category, source_url, x(경도), y(위도) 포함 dict 리스트.
+    KAKAO_REST_API_KEY 미설정 시 빈 리스트 반환.
+    """
+    api_key = os.getenv("KAKAO_REST_API_KEY")
+    if not api_key:
+        return []
+
+    try:
+        # httpx가 한국어 파라미터를 ASCII로 인코딩하려다 실패하는 것을 방지
+        # urllib.parse로 UTF-8 percent-encoding 후 URL에 직접 삽입
+        qs = urllib.parse.urlencode(
+            {"query": f"{location} {category}", "category_group_code": "FD6", "size": size},
+            encoding="utf-8",
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                f"https://dapi.kakao.com/v2/local/search/keyword.json?{qs}",
+                headers={"Authorization": f"KakaoAK {api_key}"},
+            )
+            response.raise_for_status()
+            docs = response.json().get("documents", [])
+
+        return [
+            {
+                "name":       doc.get("place_name", ""),
+                "address":    doc.get("road_address_name") or doc.get("address_name", ""),
+                "category":   doc.get("category_name", "").split(" > ")[-1],
+                "source_url": doc.get("place_url", ""),
+                "x":          doc.get("x", ""),   # 경도
+                "y":          doc.get("y", ""),   # 위도
+                "phone":      doc.get("phone", ""),
+            }
+            for doc in docs
+            if doc.get("place_name")
+        ]
+
+    except httpx.TimeoutException:
+        print("  ⚠️ 카카오 로컬 API 타임아웃")
+        return []
+    except Exception as e:
+        print(f"  ⚠️ 카카오 로컬 API 오류: {e}")
+        return []
+
+
+async def search_restaurant_reviews(restaurant_name: str, location: str = "") -> str:
+    """특정 식당의 리뷰를 Tavily로 검색. 내용 텍스트 반환."""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return ""
+
+    query = f"{location} {restaurant_name} 리뷰 후기".strip()
+    _tool = TavilySearch(max_results=3, search_depth="basic")
+    try:
+        result = _tool.invoke({"query": query})
+        results = result.get("results", []) if isinstance(result, dict) else result
+        texts = [r.get("content", "") for r in results[:3] if r.get("content")]
+        return "\n\n".join(texts)[:2000]
+    except Exception:
+        return ""

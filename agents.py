@@ -24,7 +24,10 @@ from schemas import (
     QueryParams, Restaurant, FilterResult,
     RestaurantInsight, ExtractedDetail, HitlAction, FinalSummary,
 )
-from tools import RESTAURANT_SEARCH_TOOL, extract_restaurant_detail, parse_extract_to_prompt
+from tools import (
+    RESTAURANT_SEARCH_TOOL, extract_restaurant_detail, parse_extract_to_prompt,
+    search_restaurants_kakao, search_restaurant_reviews,
+)
 
 # ────────────────────────────────────────────
 # Ollama LLM 설정
@@ -96,6 +99,44 @@ _LIST_PATTERNS = re.compile(
     r"(top\s*\d+|순위|맛집\s*(리스트|모음|추천|정리|베스트)|best\s*\d+|\d+\s*곳|\d+\s*선)",
     re.IGNORECASE,
 )
+
+# Tavily 후보 정제: 상호명 추출 + 리뷰 요약 (배치, 한 번 호출)
+_CANDIDATE_REFINE_CHAIN = (
+    ChatPromptTemplate.from_template("""
+검색어: {location} {category} 맛집
+
+아래 검색 결과 각각에 대해 분석하세요.
+- restaurant_name: 단일 식당을 소개하는 글이면 식당 상호명, 여러 식당 목록글이면 null
+- summary: 해당 식당의 분위기·맛·특징을 리뷰 내용 기반으로 2문장 이내로 요약. 목록글이면 null
+
+결과:
+{results}
+
+JSON으로만 출력:
+{{"items": [{{"idx": 0, "restaurant_name": "상호명 또는 null", "summary": "요약 또는 null"}}, ...]}}
+/no_think
+""")
+    | llm_qwen
+    | StrOutputParser()
+).with_retry(stop_after_attempt=2)
+
+
+def _parse_refine_output(raw: str, count: int) -> list:
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    for attempt in [
+        lambda: json.loads(raw),
+        lambda: json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()),
+        lambda: json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group()),
+    ]:
+        try:
+            obj = attempt()
+            items = obj.get("items", obj) if isinstance(obj, dict) else obj
+            if isinstance(items, list):
+                items.sort(key=lambda x: x.get("idx", 0))
+                return items
+        except Exception:
+            pass
+    return [{"idx": i, "restaurant_name": None, "summary": None} for i in range(count)]
 
 _EXTRACTOR_CHAIN = (
     ChatPromptTemplate.from_template("""
@@ -190,22 +231,70 @@ def router_logic(state: Dict[str, Any]) -> str:
 # 3. SEARCHER
 # ────────────────────────────────────────────
 async def searcher(state: Dict[str, Any]) -> Dict[str, Any]:
-    print(f"--- [SEARCHER] {state.get('location')} {state.get('category')} ---")
+    location = state.get("location", "")
+    category = state.get("category", "")
+    print(f"--- [SEARCHER] {location} {category} ---")
 
-    raw_results = await RESTAURANT_SEARCH_TOOL.ainvoke({"query": f"{state['location']} {state['category']} 맛집 평점 리뷰"})
+    # 1차: 카카오 로컬 API — 상호명·주소·좌표 정확, 카테고리 보장
+    kakao_results = await search_restaurants_kakao(location, category)
+    if kakao_results:
+        candidates = []
+        for item in kakao_results:
+            try:
+                candidates.append(Restaurant(
+                    name=item["name"],
+                    address=item.get("address"),
+                    category=item.get("category"),
+                    source_url=item.get("source_url"),
+                    x=item.get("x"),
+                    y=item.get("y"),
+                ).model_dump())
+            except Exception:
+                continue
+        print(f"  ✅ 카카오 로컬: {len(candidates)}개")
+        return {"candidates": candidates}
+
+    # 2차 fallback: Tavily (KAKAO_REST_API_KEY 미설정 시)
+    print("  ⚠️ 카카오 API 미설정 → Tavily fallback")
+    raw_results = await RESTAURANT_SEARCH_TOOL.ainvoke(
+        {"query": f"{location} {category} 맛집 평점 리뷰"}
+    )
+    if not raw_results:
+        return {"candidates": []}
+
+    # LLM 배치 호출: 상호명 추출 + 리뷰 요약 생성
+    results_text = "\n".join(
+        f"[{i}] 제목: {r.get('title', '')}\n    내용: {r.get('content', '')[:200]}"
+        for i, r in enumerate(raw_results)
+    )
+    try:
+        raw = await _CANDIDATE_REFINE_CHAIN.ainvoke({
+            "location": location,
+            "category": category,
+            "results": results_text,
+        })
+        refine_list = _parse_refine_output(raw, len(raw_results))
+    except Exception as e:
+        print(f"  ⚠️ 후보 정제 실패 (원본 유지): {e}")
+        refine_list = [{"idx": i, "restaurant_name": None, "summary": None} for i in range(len(raw_results))]
 
     candidates = []
-    for item in raw_results:
+    for i, (item, refined) in enumerate(zip(raw_results, refine_list)):
+        name = refined.get("restaurant_name")
+        if not name:  # 목록글 또는 단일 식당 특정 불가 → 제외
+            print(f"  ❌ 목록글 제외: {item.get('title', '')[:40]}")
+            continue
         try:
             candidates.append(Restaurant(
-                name=item.get("title", "이름 없음"),
+                name=name,
                 score=float(item.get("score", 0.0)),
                 source_url=item.get("url"),
-                summary=item.get("content", "")[:300],
+                summary=refined.get("summary") or item.get("content", "")[:300],
             ).model_dump())
         except Exception:
             continue
 
+    print(f"  ✅ 정제 후 후보: {len(candidates)}개")
     return {"candidates": candidates}
 
 
@@ -297,9 +386,16 @@ async def extract_single(state: dict) -> dict:
 
     print(f"  🔍 [EXTRACTOR] '{name}' (exaone3.5:7.8b)")
 
-    prompt_text = parse_extract_to_prompt(
-        await extract_restaurant_detail([url]) if url else [], name
-    )
+    extracted = await extract_restaurant_detail([url]) if url else []
+    prompt_text = parse_extract_to_prompt(extracted, name)
+
+    # 카카오 place URL은 리뷰 내용이 없으므로 Tavily 리뷰 검색으로 보완
+    is_kakao_url = url and "place.map.kakao.com" in url
+    if is_kakao_url or len(prompt_text) < 100:
+        location_hint = (restaurant.get("address") or "").split()[0]
+        review_text = await search_restaurant_reviews(name, location_hint)
+        if review_text:
+            prompt_text = review_text
 
     raw = await _EXTRACTOR_CHAIN.ainvoke({
         "name": name, "url": url or "", "raw_text": prompt_text[:3000],
