@@ -117,7 +117,7 @@ restaurant_recommandation/
 |---|---|---|---|
 | `manager` | qwen3.5:9b | 자연어 쿼리 | location, category, preferences, max_price |
 | `router_logic` | 로직 | location, category | `"searcher"` \| `"analyst"` |
-| `searcher` | qwen3.5:9b + API | 검색 파라미터 | candidates 목록 |
+| `searcher` | 카카오/Tavily API (Tavily 폴백 시 qwen3.5:9b로 식당명 정제) | 검색 파라미터 | candidates 목록 |
 | `filter_node` | Python 정규식 | candidates | filtered_candidates, needs_retry |
 | `filter_logic` | 로직 | needs_retry, retry_count | `"searcher"` \| `"human_approval"` |
 | `human_approval` | interrupt() | filtered_candidates | Command(goto, update) |
@@ -190,9 +190,9 @@ restaurant_recommandation/
 
 | 항목 | 내용 |
 |---|---|
-| Language | Python 3.12 |
+| Language | Python 3.14 |
 | Framework | FastAPI · Uvicorn |
-| AI Orchestration | LangGraph 0.2+ · LangChain 0.3+ |
+| AI Orchestration | LangGraph 1.1+ · LangChain 1.2+ |
 | LLM | Ollama 로컬 모델 (qwen3.5:9b · exaone3.5:7.8b · gemma4) |
 | 맛집 검색 | 카카오 로컬 API (REST) · Tavily Search API |
 | 웹 크롤링 | Tavily Extract API |
@@ -217,7 +217,7 @@ restaurant_recommandation/
 
 ### 사전 요구 사항
 
-- Python 3.12+
+- Python 3.14+
 - Node.js 18+
 - [Ollama](https://ollama.com) 설치 및 실행
 
