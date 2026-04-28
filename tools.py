@@ -5,8 +5,12 @@ tools.py
 """
 
 import os
+import json
+import asyncio
 import httpx
 import urllib.parse
+import urllib.request
+import urllib.error
 from typing import List
 from langchain_tavily import TavilySearch
 from langchain_core.runnables import RunnableLambda
@@ -15,22 +19,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def get_restaurant_search_tool() -> RunnableLambda:
-    """식당 후보 목록 검색용 Tavily Search 도구. 결과를 list[dict]로 정규화."""
-    _tool = TavilySearch(max_results=10, search_depth="advanced")
-
-    def _normalize(input_dict: dict) -> list:
-        result = _tool.invoke(input_dict)
-        if isinstance(result, dict):
-            return result.get("results", [])
-        if isinstance(result, list):
-            return result
-        return []
-
-    return RunnableLambda(_normalize)
+_tavily_search = TavilySearch(max_results=10, search_depth="advanced")
 
 
-RESTAURANT_SEARCH_TOOL: RunnableLambda = get_restaurant_search_tool()
+def _normalize_tavily(input_dict: dict) -> list:
+    result = _tavily_search.invoke(input_dict)
+    if isinstance(result, dict):
+        return result.get("results", [])
+    if isinstance(result, list):
+        return result
+    return []
+
+
+RESTAURANT_SEARCH_TOOL = RunnableLambda(_normalize_tavily)
 
 
 async def extract_restaurant_detail(urls: List[str]) -> List[dict]:
@@ -98,19 +99,21 @@ async def search_restaurants_kakao(location: str, category: str, size: int = 15)
         return []
 
     try:
-        # httpx가 한국어 파라미터를 ASCII로 인코딩하려다 실패하는 것을 방지
-        # urllib.parse로 UTF-8 percent-encoding 후 URL에 직접 삽입
-        qs = urllib.parse.urlencode(
-            {"query": f"{location} {category}", "category_group_code": "FD6", "size": size},
-            encoding="utf-8",
+        # urllib.parse.quote로 percent-encoding 후 urllib.request로 직접 요청.
+        # httpx는 URL을 내부 파싱하면서 percent-encoding을 풀어 ASCII 인코딩 오류를 유발함.
+        query_enc = urllib.parse.quote(f"{location} {category}", safe="", encoding="utf-8")
+        url = (
+            f"https://dapi.kakao.com/v2/local/search/keyword.json"
+            f"?query={query_enc}&category_group_code=FD6&size={size}"
         )
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(
-                f"https://dapi.kakao.com/v2/local/search/keyword.json?{qs}",
-                headers={"Authorization": f"KakaoAK {api_key}"},
-            )
-            response.raise_for_status()
-            docs = response.json().get("documents", [])
+        req = urllib.request.Request(url, headers={"Authorization": f"KakaoAK {api_key}"})
+
+        def _fetch():
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+
+        data = await asyncio.to_thread(_fetch)
+        docs = data.get("documents", [])
 
         return [
             {
@@ -118,16 +121,20 @@ async def search_restaurants_kakao(location: str, category: str, size: int = 15)
                 "address":    doc.get("road_address_name") or doc.get("address_name", ""),
                 "category":   doc.get("category_name", "").split(" > ")[-1],
                 "source_url": doc.get("place_url", ""),
-                "x":          doc.get("x", ""),   # 경도
-                "y":          doc.get("y", ""),   # 위도
+                "x":          doc.get("x", ""),
+                "y":          doc.get("y", ""),
                 "phone":      doc.get("phone", ""),
             }
             for doc in docs
             if doc.get("place_name")
         ]
 
-    except httpx.TimeoutException:
-        print("  ⚠️ 카카오 로컬 API 타임아웃")
+    except urllib.error.URLError as e:
+        reason = str(e.reason) if hasattr(e, "reason") else str(e)
+        if "timed out" in reason.lower():
+            print("  ⚠️ 카카오 로컬 API 타임아웃")
+        else:
+            print(f"  ⚠️ 카카오 로컬 API 오류: {e}")
         return []
     except Exception as e:
         print(f"  ⚠️ 카카오 로컬 API 오류: {e}")
@@ -143,7 +150,7 @@ async def search_restaurant_reviews(restaurant_name: str, location: str = "") ->
     query = f"{location} {restaurant_name} 리뷰 후기".strip()
     _tool = TavilySearch(max_results=3, search_depth="basic")
     try:
-        result = _tool.invoke({"query": query})
+        result = await _tool.ainvoke({"query": query})
         results = result.get("results", []) if isinstance(result, dict) else result
         texts = [r.get("content", "") for r in results[:3] if r.get("content")]
         return "\n\n".join(texts)[:2000]

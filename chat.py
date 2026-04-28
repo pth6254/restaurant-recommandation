@@ -20,12 +20,13 @@ import uuid
 import json
 import asyncio
 from pathlib import Path
-from typing import List, Optional, AsyncGenerator
+from typing import Dict, List, Optional, AsyncGenerator
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from langgraph.types import Command
+from langgraph.errors import GraphInterrupt
 
 import app_state
 from schemas import HitlAction
@@ -78,8 +79,8 @@ def sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def sse_progress(node: str, label: str, extra: dict = {}) -> str:
-    return sse_event("progress", {"node": node, "label": label, **extra})
+def sse_progress(node: str, label: str, extra: Optional[Dict] = None) -> str:
+    return sse_event("progress", {"node": node, "label": label, **(extra or {})})
 
 
 def sse_result(data: dict) -> str:
@@ -124,7 +125,7 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
     async def generate() -> AsyncGenerator[str, None]:
         try:
             completed_subgraphs = 0
-            print(f"\n[DEBUG] 검색 시작: {query}")
+            print(f"\n[START] 검색 시작: {query}")
 
             async for event in app_state.langgraph_app.astream_events(
                 {"query": query, "insights": []},
@@ -133,10 +134,8 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
             ):
                 name = event.get("name", "")
                 kind = event.get("event", "")
-                if kind != "on_chat_model_stream":
-                    print(f"[DEBUG] event: kind={kind}, name={name}")
 
-                # interrupt 감지 → 루프 탈출
+                # LangGraph 0.2.x 스타일 interrupt 감지 (하위 호환)
                 if kind == "on_chain_end" and "__interrupt__" in (event.get("data", {}).get("output") or {}):
                     break
 
@@ -148,7 +147,7 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
                     else:
                         yield sse_progress(name, NODE_LABELS[name])
 
-            # 최종 상태에서 candidates 추출 → result 이벤트
+            # interrupt() 이후 루프가 자연 종료되거나 break → 상태에서 candidates 추출
             state      = await app_state.langgraph_app.aget_state(config)
             candidates = state.values.get("filtered_candidates", [])
             location   = state.values.get("location", "")
@@ -165,11 +164,27 @@ async def start_stream(query: str = Query(..., description="검색 질문")):
                     "status":     "waiting_selection",
                 })
 
+        except GraphInterrupt:
+            # LangGraph 1.x: interrupt()가 GraphInterrupt를 외부로 전파하는 경우 정상 처리
+            state      = await app_state.langgraph_app.aget_state(config)
+            candidates = state.values.get("filtered_candidates", [])
+            location   = state.values.get("location", "")
+            category   = state.values.get("category", "")
+            if not candidates:
+                yield sse_result({"thread_id": thread_id, "candidates": [], "status": "no_results"})
+            else:
+                yield sse_result({
+                    "thread_id": thread_id,
+                    "candidates": candidates,
+                    "location":   location,
+                    "category":   category,
+                    "status":     "waiting_selection",
+                })
         except asyncio.CancelledError:
-            print("[DEBUG] 클라이언트 연결 끊김 (정상)")
+            print("[START] 클라이언트 연결 끊김 (정상)")
         except Exception as e:
             import traceback
-            print(f"[DEBUG] 예외 발생:\n{traceback.format_exc()}")
+            print(f"[START] 예외 발생:\n{traceback.format_exc()}")
             yield sse_error(f"검색 중 오류 발생: {str(e)}")
 
     return StreamingResponse(
@@ -287,14 +302,17 @@ async def reject_and_research(req: RejectRequest):
 
     hitl_response = HitlAction(action="reject", feedback=req.feedback)
 
-    async for event in app_state.langgraph_app.astream_events(
-        Command(resume=hitl_response),
-        config,
-        version="v2",
-    ):
-        kind = event.get("event", "")
-        if kind == "on_chain_end" and "__interrupt__" in (event.get("data", {}).get("output") or {}):
-            break
+    try:
+        async for event in app_state.langgraph_app.astream_events(
+            Command(resume=hitl_response),
+            config,
+            version="v2",
+        ):
+            kind = event.get("event", "")
+            if kind == "on_chain_end" and "__interrupt__" in (event.get("data", {}).get("output") or {}):
+                break
+    except GraphInterrupt:
+        pass  # LangGraph 1.x 정상 동작
 
     new_state  = await app_state.langgraph_app.aget_state(config)
     candidates = new_state.values.get("filtered_candidates", [])

@@ -8,6 +8,7 @@ import KakaoMap from "../components/KakaoMap";
 const spin   = keyframes`to { transform: rotate(360deg); }`;
 const fadeIn = keyframes`from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); }`;
 const fadeUp = keyframes`from { opacity:0; transform:translateY(28px); } to { opacity:1; transform:translateY(0); }`;
+const blink  = keyframes`0%,100% { opacity:1; } 50% { opacity:0; }`;
 
 /* ── 히어로 (IDLE 전용) ──────────────────────────────────── */
 const Hero = styled.div`
@@ -312,6 +313,17 @@ const Report = styled.div`
   font-size: 0.92rem;
 `;
 
+const Cursor = styled.span`
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--accent);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: ${blink} 0.8s step-end infinite;
+`;
+
+
 const ShareBtn = styled.button`
   padding: 10px 20px;
   border: 1px solid var(--border);
@@ -389,6 +401,15 @@ const FeedbackBox = styled.div`
 const ConfirmFeedbackBtn = styled.button`background: var(--accent); color: #fff;`;
 const CancelFeedbackBtn  = styled.button`border: 1px solid var(--border); color: var(--text-muted); background: var(--bg3);`;
 
+const RejectBtn = styled.button`
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  background: var(--bg3);
+`;
+
 /* ── 예시 칩 데이터 ──────────────────────────────────────── */
 const EXAMPLES = [
   { location: "강남역",  category: "파스타"  },
@@ -424,9 +445,15 @@ export default function ChatPage() {
   const [error,         setError]         = useState("");
   const [showFeedback,  setShowFeedback]  = useState(false);
   const [feedbackText,  setFeedbackText]  = useState("");
+  const [isTyping,      setIsTyping]      = useState(false);
 
-  const esRef = useRef(null);
-  useEffect(() => () => esRef.current?.close(), []);
+  const esRef        = useRef(null);
+  const typewriterRef = useRef(null);
+
+  useEffect(() => () => {
+    esRef.current?.close();
+    clearInterval(typewriterRef.current);
+  }, []);
 
   const combinedQuery = [locationInput, categoryInput].filter(Boolean).join(" ");
   const isStreaming   = step === STEPS.LOADING || step === STEPS.ANALYZING;
@@ -460,9 +487,27 @@ export default function ChatPage() {
     };
   };
 
+  /* ── 타이핑 효과 ────────────────── */
+  const startTypewriter = (fullText) => {
+    clearInterval(typewriterRef.current);
+    setReport("");
+    setIsTyping(true);
+    let i = 0;
+    typewriterRef.current = setInterval(() => {
+      i++;
+      setReport(fullText.slice(0, i));
+      if (i >= fullText.length) {
+        clearInterval(typewriterRef.current);
+        setIsTyping(false);
+      }
+    }, 8);
+  };
+
   /* ── 검색 시작 ──────────────────── */
   const handleSearch = () => {
     if (!combinedQuery || isStreaming) return;
+    clearInterval(typewriterRef.current);
+    setIsTyping(false);
     setError("");
     setStep(STEPS.LOADING);
     setSelected([]);
@@ -500,9 +545,10 @@ export default function ChatPage() {
     if (selected.length === 0) return;
     setStep(STEPS.ANALYZING);
     setProgLogs([]);
+    setReport("");
     openSSE(api.selectStream(threadId, selected.join(",")), (data) => {
-      setReport(data.final_answer);
       setStep(STEPS.DONE);
+      startTypewriter(data.final_answer);
     });
   };
 
@@ -735,16 +781,9 @@ export default function ChatPage() {
                   </FeedbackBox>
                 ) : (
                   <div style={{ textAlign: "right", marginBottom: 12 }}>
-                    <button
-                      onClick={() => setShowFeedback(true)}
-                      style={{
-                        padding: "8px 16px", border: "1px solid var(--border)",
-                        borderRadius: 8, color: "var(--text-muted)",
-                        fontSize: "0.85rem", background: "var(--bg3)",
-                      }}
-                    >
+                    <RejectBtn onClick={() => setShowFeedback(true)}>
                       ❌ 이 결과 마음에 안 들어요 (재검색)
-                    </button>
+                    </RejectBtn>
                   </div>
                 )}
 
@@ -762,10 +801,15 @@ export default function ChatPage() {
         {step === STEPS.DONE && report && (
           <Section>
             <h2>✨ AI 추천 리포트</h2>
-            <Report>{report}</Report>
-            <ShareBtn onClick={handleShare}>
-              {shareUrl ? `✅ 복사됨: ${shareUrl}` : "🔗 이 결과 공유하기"}
-            </ShareBtn>
+            <Report>
+              {report}
+              {isTyping && <Cursor />}
+            </Report>
+            {!isTyping && (
+              <ShareBtn onClick={handleShare}>
+                {shareUrl ? `✅ 복사됨: ${shareUrl}` : "🔗 이 결과 공유하기"}
+              </ShareBtn>
+            )}
           </Section>
         )}
       </Page>

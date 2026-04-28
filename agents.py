@@ -12,7 +12,7 @@ agents.py
 import os
 import json
 import re
-from typing import Dict, Any, List, Optional, Type, TypeVar
+from typing import Any, Dict, List, Type, TypeVar
 
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
@@ -21,7 +21,7 @@ from langgraph.types import interrupt, Command
 from pydantic import BaseModel
 
 from schemas import (
-    QueryParams, Restaurant, FilterResult,
+    QueryParams, Restaurant,
     RestaurantInsight, ExtractedDetail, HitlAction, FinalSummary,
 )
 from tools import (
@@ -56,17 +56,29 @@ llm_gemma_text = ChatOllama(
 # ────────────────────────────────────────────
 T = TypeVar("T", bound=BaseModel)
 
-def parse_structured_output(raw: str, schema: Type[T], fallback: T) -> T:
-    # Qwen3 계열 모델의 <think>...</think> 블록 제거
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_MD_CODE_RE = re.compile(r"```(?:json)?\s*|\s*```")
 
-    for attempt in [
-        lambda: json.loads(raw.strip()),
-        lambda: json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()),
-        lambda: json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group()),
-    ]:
+
+def _try_parse_json(text: str) -> Any:
+    for attempt in (
+        lambda t: json.loads(t.strip()),
+        lambda t: json.loads(_MD_CODE_RE.sub("", t).strip()),
+        lambda t: json.loads(re.search(r"\{.*\}", t, re.DOTALL).group()),
+    ):
         try:
-            return schema.model_validate(attempt())
+            return attempt(text)
+        except Exception:
+            pass
+    return None
+
+
+def parse_structured_output(raw: str, schema: Type[T], fallback: T) -> T:
+    raw = _THINK_RE.sub("", raw).strip()
+    parsed = _try_parse_json(raw)
+    if parsed is not None:
+        try:
+            return schema.model_validate(parsed)
         except Exception:
             pass
     print(f"  ⚠️ 파싱 실패 → fallback 사용 | 원문: {raw[:150]}")
@@ -94,20 +106,22 @@ _MANAGER_CHAIN = (
     | StrOutputParser()
 ).with_retry(stop_after_attempt=3)
 
-# 목록형 블로그 포스트 제목 패턴 (LLM 없이 Python으로 필터링)
+# filter_node: 너무 짧은 summary 제거용
 _LIST_PATTERNS = re.compile(
-    r"(top\s*\d+|순위|맛집\s*(리스트|모음|추천|정리|베스트)|best\s*\d+|\d+\s*곳|\d+\s*선)",
+    r"(top\s*\d+|맛집\s*(리스트|모음|정리)|best\s*\d+|\d+\s*곳\s*맛집|\d+\s*선\s*맛집)",
     re.IGNORECASE,
 )
 
-# Tavily 후보 정제: 상호명 추출 + 리뷰 요약 (배치, 한 번 호출)
+# Tavily 후보 정제: 본문 내용 기준으로 식당명 추출 + 요약
 _CANDIDATE_REFINE_CHAIN = (
     ChatPromptTemplate.from_template("""
-검색어: {location} {category} 맛집
+아래 검색 결과에서 각각 단일 식당을 식별하고 상호명을 추출하세요.
+제목이 목록처럼 보여도 본문 내용이 특정 식당을 주로 다루면 그 식당명을 추출하세요.
 
-아래 검색 결과 각각에 대해 분석하세요.
-- restaurant_name: 단일 식당을 소개하는 글이면 식당 상호명, 여러 식당 목록글이면 null
-- summary: 해당 식당의 분위기·맛·특징을 리뷰 내용 기반으로 2문장 이내로 요약. 목록글이면 null
+- restaurant_name: 본문에서 주로 소개하는 식당의 공식 상호명. 여러 식당을 나열하는 목록 글이면 null
+- summary: 해당 식당의 분위기·맛·특징을 2문장 이내로 요약. 특정 불가면 null
+
+검색어: {location} {category}
 
 결과:
 {results}
@@ -122,15 +136,11 @@ JSON으로만 출력:
 
 
 def _parse_refine_output(raw: str, count: int) -> list:
-    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-    for attempt in [
-        lambda: json.loads(raw),
-        lambda: json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()),
-        lambda: json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group()),
-    ]:
+    raw = _THINK_RE.sub("", raw).strip()
+    parsed = _try_parse_json(raw)
+    if parsed is not None:
         try:
-            obj = attempt()
-            items = obj.get("items", obj) if isinstance(obj, dict) else obj
+            items = parsed.get("items", parsed) if isinstance(parsed, dict) else parsed
             if isinstance(items, list):
                 items.sort(key=lambda x: x.get("idx", 0))
                 return items
@@ -262,7 +272,7 @@ async def searcher(state: Dict[str, Any]) -> Dict[str, Any]:
     if not raw_results:
         return {"candidates": []}
 
-    # LLM 배치 호출: 상호명 추출 + 리뷰 요약 생성
+    # LLM 배치 호출: 본문 기준으로 상호명 추출 + 리뷰 요약 생성
     results_text = "\n".join(
         f"[{i}] 제목: {r.get('title', '')}\n    내용: {r.get('content', '')[:200]}"
         for i, r in enumerate(raw_results)
@@ -281,8 +291,8 @@ async def searcher(state: Dict[str, Any]) -> Dict[str, Any]:
     candidates = []
     for i, (item, refined) in enumerate(zip(raw_results, refine_list)):
         name = refined.get("restaurant_name")
-        if not name:  # 목록글 또는 단일 식당 특정 불가 → 제외
-            print(f"  ❌ 목록글 제외: {item.get('title', '')[:40]}")
+        if not name:
+            print(f"  ⚠️ 이름 추출 실패 (제외): {item.get('title', '')[:55]}")
             continue
         try:
             candidates.append(Restaurant(
@@ -309,9 +319,9 @@ def filter_node(state: Dict[str, Any]) -> Dict[str, Any]:
         title   = (item.get("name") or "").strip()
         content = (item.get("summary") or "").strip()
 
-        if _LIST_PATTERNS.search(title):   # 목록형 블로그 포스트 제외
+        if _LIST_PATTERNS.search(title):        # 목록형 블로그 포스트 제외
             continue
-        if len(content) < 30:              # 내용 너무 짧으면 제외
+        if content and len(content) < 30:   # summary가 있는데 너무 짧을 때만 제외 (카카오 결과는 summary 없음)
             continue
 
         filtered.append({
@@ -429,6 +439,9 @@ async def analyst_single(state: dict) -> dict:
         raw, RestaurantInsight,
         RestaurantInsight(name=name, pros=["정보 부족"], cons=[], recommendation_reason="추가 확인 필요")
     )
+    # ExtractedDetail에서 영업시간 주입 (LLM 출력에 없을 경우 대비)
+    if not result.opening_hours and detail.get("opening_hours"):
+        result = result.model_copy(update={"opening_hours": detail["opening_hours"]})
     return {**state, "insight": result.model_dump()}
 
 
@@ -467,6 +480,8 @@ def writer(state: Dict[str, Any]) -> Dict[str, Any]:
     lines = ["🍽️ AI 맛집 추천 리포트", "=" * 40, ""]
     for idx, insight in enumerate(insights, 1):
         lines.append(f"[{idx}위] {insight.get('name', '')}")
+        if insight.get("opening_hours"):
+            lines.append(f"  🕐 영업시간: {insight['opening_hours']}")
         if insight.get("best_menu"):
             lines.append(f"  🍜 대표 메뉴: {insight['best_menu']}")
         lines.append(f"  ✅ 장점: {', '.join(insight.get('pros', []))}")

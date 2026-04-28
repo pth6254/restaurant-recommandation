@@ -40,12 +40,7 @@ class RestaurantInsight(BaseModel):
     cons: List[str]
     recommendation_reason: str
     best_menu: Optional[str] = None
-
-
-class AnalysisReport(BaseModel):
-    insights: List[RestaurantInsight]
-    top_pick: str
-    summary: str
+    opening_hours: Optional[str] = None
 
 
 class ExtractedDetail(BaseModel):
